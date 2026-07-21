@@ -8,6 +8,7 @@ import argparse
 import errno
 import logging as log
 import os
+import platform
 import shlex
 import subprocess
 import sys
@@ -60,72 +61,83 @@ def sysfs_write(path: Path, text):
         return f.write(f"{text}\n")
 
 
-def list_supported_sizes():
-    sizes = []
-    for entry in SYSFS_HUGEPAGES.glob("hugepages-*kB"):
-        sizes.append(entry.name.split("-")[1].replace("kB", ""))
-    return sizes
+class LinuxBackend:
+    """Hugepage management on Linux via sysfs and hugetlbfs
+
+    A backend provides ``supported_sizes``/``info``/``setup``/``mount``;
+    get_backend() picks one per platform and main() dispatches to it.
+    """
+
+    def supported_sizes(self):
+        sizes = []
+        for entry in SYSFS_HUGEPAGES.glob("hugepages-*kB"):
+            sizes.append(entry.name.split("-")[1].replace("kB", ""))
+        return sizes
+
+    def info(self, args):
+        print("Hugepage Support:")
+        for entry in SYSFS_HUGEPAGES.glob("hugepages-*kB"):
+            size = entry.name.split("-")[1]
+            nr = int((entry / "nr_hugepages").read_text())
+            free = int((entry / "free_hugepages").read_text())
+            resv = int((entry / "resv_hugepages").read_text())
+            print(f"  Size: {size}  Total: {nr}  Free: {free}  Reserved: {resv}")
+
+    def setup(self, args):
+        """Setup hugepages via sysfs"""
+
+        target = SYSFS_HUGEPAGES / f"hugepages-{args.size}kB" / "nr_hugepages"
+        if not target.exists():
+            log.error(f"Invalid hugepage size: {args.size}kB")
+            sys.exit(1)
+
+        try:
+            sysfs_write(target, str(args.count))
+        except PermissionError:
+            log.error("Reserving hugepages requires root. Re-run with sudo.")
+            sys.exit(errno.EPERM)
+
+        try:
+            actual = int(target.read_text())
+            # count(0) is the documented way to release the pool, so reading
+            # back 0 is success there rather than a failed reservation.
+            if args.count and not actual:
+                log.error(
+                    f"No hugepages were reserved out of count({args.count}) for size({args.size}) kB"
+                )
+            elif actual < args.count:
+                log.warning(
+                    f"Only {actual} hugepage(s) were reserved out of count({args.count}) for size({args.size}) kB"
+                )
+        except Exception as exc:
+            log.error(f"Failed to verify hugepage allocation: {exc}")
+            sys.exit(1)
+
+    def mount(self, args):
+        mountpoint = Path(args.mountpoint or "/dev/hugepages")
+        if not mountpoint.exists():
+            mountpoint.mkdir(parents=True)
+
+        cmd = ["mount", "-t", "hugetlbfs", "nodev", str(mountpoint)]
+        if args.pagesize:
+            cmd += ["-o", f"pagesize={args.pagesize}k"]
+        result = run(cmd)
+        if result.returncode != 0:
+            log.error(f"Failed to mount hugetlbfs: {result.stderr}")
+            sys.exit(1)
+        print(f"Mounted hugetlbfs at {mountpoint}")
 
 
-def show_info(args):
-    print("Hugepage Support:")
-    for entry in SYSFS_HUGEPAGES.glob("hugepages-*kB"):
-        size = entry.name.split("-")[1]
-        nr = int((entry / "nr_hugepages").read_text())
-        free = int((entry / "free_hugepages").read_text())
-        resv = int((entry / "resv_hugepages").read_text())
-        print(f"  Size: {size}  Total: {nr}  Free: {free}  Reserved: {resv}")
+def get_backend(system=None):
+    system = system or platform.system()
+    if system == "Linux":
+        return LinuxBackend()
+    return None
 
 
-def setup_pages(args):
-    """Setup hugepages via sysfs"""
-
-    target = SYSFS_HUGEPAGES / f"hugepages-{args.size}kB" / "nr_hugepages"
-    if not target.exists():
-        log.error(f"Invalid hugepage size: {args.size}kB")
-        sys.exit(1)
-
+def parse_args(backend):
     try:
-        sysfs_write(target, str(args.count))
-    except PermissionError:
-        log.error("Reserving hugepages requires root. Re-run with sudo.")
-        sys.exit(errno.EPERM)
-
-    try:
-        actual = int(target.read_text())
-        # count(0) is the documented way to release the pool, so reading
-        # back 0 is success there rather than a failed reservation.
-        if args.count and not actual:
-            log.error(
-                f"No hugepages were reserved out of count({args.count}) for size({args.size}) kB"
-            )
-        elif actual < args.count:
-            log.warning(
-                f"Only {actual} hugepage(s) were reserved out of count({args.count}) for size({args.size}) kB"
-            )
-    except Exception as exc:
-        log.error(f"Failed to verify hugepage allocation: {exc}")
-        sys.exit(1)
-
-
-def mount_hugetlbfs(args):
-    mountpoint = Path(args.mountpoint or "/dev/hugepages")
-    if not mountpoint.exists():
-        mountpoint.mkdir(parents=True)
-
-    cmd = ["mount", "-t", "hugetlbfs", "nodev", str(mountpoint)]
-    if args.pagesize:
-        cmd += ["-o", f"pagesize={args.pagesize}k"]
-    result = run(cmd)
-    if result.returncode != 0:
-        log.error(f"Failed to mount hugetlbfs: {result.stderr}")
-        sys.exit(1)
-    print(f"Mounted hugetlbfs at {mountpoint}")
-
-
-def parse_args():
-    try:
-        supported_sizes = list_supported_sizes()
+        supported_sizes = backend.supported_sizes() if backend else []
     except Exception as exc:
         supported_sizes = []
         log.warning(f"Could not read supported hugepage sizes: {exc}")
@@ -165,7 +177,8 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
+    backend = get_backend()
+    args = parse_args(backend)
 
     if args.print_completion == "bash":
         sys.stdout.write(BASH_COMPLETION)
@@ -176,15 +189,20 @@ def main():
         format="# %(levelname)s: %(message)s",
     )
 
-    if args.command == "info":
-        show_info(args)
-    elif args.command == "setup":
-        setup_pages(args)
-    elif args.command == "mount":
-        mount_hugetlbfs(args)
-    else:
+    if args.command is None:
         log.error("No command specified. Use --help.")
         sys.exit(1)
+
+    if backend is None:
+        log.error(f"Unsupported platform: {platform.system()}. Supported: Linux.")
+        sys.exit(1)
+
+    if args.command == "info":
+        backend.info(args)
+    elif args.command == "setup":
+        backend.setup(args)
+    elif args.command == "mount":
+        backend.mount(args)
 
 
 if __name__ == "__main__":

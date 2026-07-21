@@ -19,3 +19,10 @@ def test_import():
     from hugepages import main
 
     assert callable(main)
+
+
+def test_get_backend_dispatch():
+    from hugepages import hugepages
+
+    assert isinstance(hugepages.get_backend("Linux"), hugepages.LinuxBackend)
+    assert hugepages.get_backend("Darwin") is None
