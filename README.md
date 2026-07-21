@@ -6,11 +6,13 @@
 [![Python](https://img.shields.io/pypi/pyversions/hugepages.svg)](https://pypi.org/project/hugepages/)
 [![Test](https://github.com/xnvme/hugepages/actions/workflows/test.yml/badge.svg)](https://github.com/xnvme/hugepages/actions/workflows/test.yml)
 
-`hugepages` is a small CLI for inspecting and configuring the Linux
-hugepage pool. It reports current totals, free, and reserved counts per
-supported page size, reserves pages via the sysfs interface at
+`hugepages` is a small CLI for inspecting and configuring hugepages on
+Linux and FreeBSD. On Linux it reports current totals, free, and reserved
+counts per supported page size, reserves pages via the sysfs interface at
 `/sys/kernel/mm/hugepages/`, and mounts the hugetlbfs filesystem
-(default `/dev/hugepages`).
+(default `/dev/hugepages`). On FreeBSD, where large pages are transparent
+superpages, `info` reports superpage state and statistics via sysctl; see
+[Platform differences](#platform-differences).
 
 ## Install
 
@@ -40,7 +42,7 @@ $ hugepages --help
 usage: hugepages [-h] [--version] [--verbose] [--print-completion SHELL]
                  {info,setup,mount} ...
 
-Inspect and manage Linux hugepages
+Inspect and manage Linux/FreeBSD hugepages
 
 positional arguments:
   {info,setup,mount}
@@ -90,6 +92,28 @@ needed. Modern DPDK and custom xNVMe/uPCIe code take this path.
 (default `/dev/hugepages`). Programs that want file-backed hugepages
 with named-page semantics open and mmap files under the mountpoint.
 SPDK and classic DPDK with `--huge-dir` use this path.
+
+## Platform differences
+
+Linux and FreeBSD expose large pages through different models, so the same
+subcommands behave differently per platform:
+
+| Command | Linux | FreeBSD |
+| ------- | ----- | ------- |
+| `info`  | totals/free/reserved per size from `/sys/kernel/mm/hugepages/` | superpage state + promotion/demotion stats via `sysctl` |
+| `setup` | reserves pages in the kernel pool via sysfs | informational — no manual pool exists |
+| `mount` | mounts `hugetlbfs` (default `/dev/hugepages`) | informational — there is no `hugetlbfs` |
+
+FreeBSD manages large pages as transparent, reservation-based
+*superpages*: the VM promotes and demotes them automatically, there is no
+pool to reserve, and there is no `hugetlbfs` to mount. Applications that
+want large pages request them directly with
+`mmap(..., MAP_ALIGNED_SUPER)`. Because of this, on FreeBSD only `info`
+reports real state; `setup` and `mount` print an explanation and exit
+without changing anything. `info` reads `hw.pagesizes` plus the superpage
+knob and mapping counters, whose names differ per architecture:
+`vm.pmap.pg_ps_enabled` and `vm.pmap.pde.*` on amd64/i386,
+`vm.pmap.superpages_enabled` and `vm.pmap.l2.*` on arm64.
 
 ## Related
 

@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) Simon Andreas Frimann Lund <os@safl.dk>
 #
-# Tool for inspecting and configuring hugepages on Linux
+# Tool for inspecting and configuring hugepages on Linux and FreeBSD
 #
 import argparse
 import errno
 import logging as log
 import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -64,9 +65,13 @@ def sysfs_write(path: Path, text):
 class LinuxBackend:
     """Hugepage management on Linux via sysfs and hugetlbfs
 
-    A backend provides ``supported_sizes``/``info``/``setup``/``mount``;
-    get_backend() picks one per platform and main() dispatches to it.
+    A backend provides ``info``/``setup``/``mount`` plus a ``configurable``
+    flag. Only configurable backends -- those whose ``setup`` really reserves
+    pages -- take a --count and provide ``supported_sizes()`` to enumerate the
+    --size choices; see parse_args().
     """
+
+    configurable = True
 
     def supported_sizes(self):
         sizes = []
@@ -128,21 +133,133 @@ class LinuxBackend:
         print(f"Mounted hugetlbfs at {mountpoint}")
 
 
+class FreeBSDBackend:
+    """Large-page (superpage) inspection on FreeBSD.
+
+    FreeBSD manages large pages transparently as reservation-based
+    "superpages": there is no manually reserved pool and no hugetlbfs.
+    The VM promotes and demotes superpages automatically, so ``setup`` and
+    ``mount`` are informational on this platform and only ``info`` reports
+    real state, sourced from sysctl.
+
+    Not configurable: ``setup`` takes no --count and there are no --size
+    choices to enumerate, so no ``supported_sizes()``.
+    """
+
+    configurable = False
+
+    # amd64/i386 name the superpage knob vm.pmap.pg_ps_enabled and keep the
+    # 2 MiB counters under vm.pmap.pde; arm64 uses vm.pmap.superpages_enabled
+    # and vm.pmap.l2. Try each spelling and use whichever the kernel answers.
+    ENABLED_OIDS = ("vm.pmap.pg_ps_enabled", "vm.pmap.superpages_enabled")
+    STAT_NODES = ("vm.pmap.pde", "vm.pmap.l2")
+    STAT_LEAVES = ("mappings", "promotions", "demotions", "p_failures")
+
+    def _sysctl(self, name):
+        result = run(["sysctl", "-n", name])
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    def _first_sysctl(self, names):
+        """Return (name, value) for the first of `names` the kernel answers"""
+
+        for name in names:
+            value = self._sysctl(name)
+            if value is not None:
+                return name, value
+        return None, None
+
+    @staticmethod
+    def parse_pagesizes(raw):
+        """Parse hw.pagesizes, which sysctl(8) renders in two formats
+
+        FreeBSD 13 and later print "{ 4096, 2097152 }"; older releases print a
+        plain space-separated array padded with zeroes up to MAXPAGESIZES.
+        Pull the integers out of either form and drop the zero padding.
+        """
+
+        if not raw:
+            return []
+        return [size for size in (int(tok) for tok in re.findall(r"\d+", raw)) if size]
+
+    def _pagesizes(self):
+        return self.parse_pagesizes(self._sysctl("hw.pagesizes"))
+
+    def info(self, args):
+        # Collected first so a run that reads nothing fails without having
+        # already printed a header onto stdout.
+        lines = []
+
+        name, enabled = self._first_sysctl(self.ENABLED_OIDS)
+        if enabled is not None:
+            state = "enabled" if enabled == "1" else "disabled"
+            lines.append(f"  Superpages: {state} ({name}={enabled})")
+
+        for size in self._pagesizes():
+            lines.append(f"  Page size: {size} bytes ({size // 1024} kB)")
+
+        for node in self.STAT_NODES:
+            stats = [(leaf, self._sysctl(f"{node}.{leaf}")) for leaf in self.STAT_LEAVES]
+            stats = [(leaf, value) for leaf, value in stats if value is not None]
+            if not stats:
+                continue
+            lines.append(f"  2 MiB superpage mappings ({node}):")
+            lines += [f"    {leaf}: {value}" for leaf, value in stats]
+            break
+
+        if not lines:
+            log.error("Could not read any superpage state from sysctl; nothing to report.")
+            sys.exit(1)
+
+        print("Hugepage (superpage) Support:")
+        print("\n".join(lines))
+
+    def setup(self, args):
+        print(
+            "FreeBSD manages large pages as transparent, reservation-based "
+            "superpages.\n"
+            "There is no manually reserved pool to configure; the VM promotes "
+            "and\n"
+            "demotes superpages automatically."
+        )
+        name, enabled = self._first_sysctl(self.ENABLED_OIDS)
+        if enabled is not None:
+            state = "enabled" if enabled == "1" else "disabled"
+            print(f"Superpages are currently {state} ({name}={enabled}).")
+            print(f"To disable superpages globally, set the loader tunable {name}=0.")
+
+    def mount(self, args):
+        print(
+            "FreeBSD has no hugetlbfs to mount.\n"
+            "Applications request superpages directly via "
+            "mmap(..., MAP_ALIGNED_SUPER);\n"
+            "the kernel backs the mapping with large pages when alignment and "
+            "size permit."
+        )
+
+
 def get_backend(system=None):
     system = system or platform.system()
     if system == "Linux":
         return LinuxBackend()
+    if system == "FreeBSD":
+        return FreeBSDBackend()
     return None
 
 
 def parse_args(backend):
+    # Only ask backends that actually reserve pages. Probing a backend costs a
+    # sysctl(8) call on FreeBSD, and it would run on every invocation --
+    # including --help and --version -- to populate a --size choice that the
+    # informational FreeBSD setup never reads.
     try:
-        supported_sizes = backend.supported_sizes() if backend else []
+        supported_sizes = backend.supported_sizes() if backend and backend.configurable else []
     except Exception as exc:
         supported_sizes = []
         log.warning(f"Could not read supported hugepage sizes: {exc}")
 
-    parser = argparse.ArgumentParser(description="Inspect and manage Linux hugepages")
+    parser = argparse.ArgumentParser(description="Inspect and manage Linux/FreeBSD hugepages")
 
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
@@ -160,7 +277,14 @@ def parse_args(backend):
         help="Hugepage size in kB",
     )
 
-    setup.add_argument("--count", required=True, type=int, help="Number of pages to reserve")
+    # Only backends that actually reserve pages need a count; on FreeBSD setup
+    # is informational and must stay runnable with no arguments.
+    setup.add_argument(
+        "--count",
+        required=bool(backend and backend.configurable),
+        type=int,
+        help="Number of pages to reserve",
+    )
 
     mount = subparsers.add_parser("mount", help="Mount hugetlbfs")
     mount.add_argument("--mountpoint", help="Mount location (default: /dev/hugepages)")
@@ -184,9 +308,13 @@ def main():
         sys.stdout.write(BASH_COMPLETION)
         return
 
+    # force=True: probing the platform in parse_args() may already have logged,
+    # which implicitly configures the root logger. Without force this call is a
+    # no-op and --verbose silently does nothing.
     log.basicConfig(
         level=log.DEBUG if args.verbose else log.INFO,
         format="# %(levelname)s: %(message)s",
+        force=True,
     )
 
     if args.command is None:
@@ -194,7 +322,7 @@ def main():
         sys.exit(1)
 
     if backend is None:
-        log.error(f"Unsupported platform: {platform.system()}. Supported: Linux.")
+        log.error(f"Unsupported platform: {platform.system()}. Supported: Linux, FreeBSD.")
         sys.exit(1)
 
     if args.command == "info":
