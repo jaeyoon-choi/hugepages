@@ -93,7 +93,9 @@ def setup_pages(args):
 
     try:
         actual = int(target.read_text())
-        if not actual:
+        # count(0) is the documented way to release the pool, so reading
+        # back 0 is success there rather than a failed reservation.
+        if args.count and not actual:
             log.error(
                 f"No hugepages were reserved out of count({args.count}) for size({args.size}) kB"
             )
