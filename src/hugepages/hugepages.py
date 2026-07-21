@@ -14,11 +14,6 @@ from pathlib import Path
 
 __version__ = "0.2.10"
 
-HUGEPAGE_MOUNTS = [
-    "/dev/hugepages",
-    "/mnt/huge",
-    "/hugepages",
-]
 SYSFS_HUGEPAGES = Path("/sys/kernel/mm/hugepages")
 
 BASH_COMPLETION = r"""# bash completion for hugepages
@@ -26,7 +21,7 @@ _hugepages() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
     local subcommands="info setup mount"
-    local global_opts="--verbose --help --print-completion"
+    local global_opts="--verbose --version --help --print-completion"
     case "${prev}" in
         --mountpoint)
             compopt -o default 2>/dev/null
