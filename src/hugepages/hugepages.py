@@ -8,6 +8,7 @@ import argparse
 import errno
 import logging as log
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -46,11 +47,11 @@ complete -F _hugepages hugepages
 """
 
 
-def run(cmd: str):
-    """Run a command and capture the output"""
+def run(cmd: list):
+    """Run a command, without a shell, and capture the output"""
 
-    log.info(f"cmd({cmd})")
-    return subprocess.run(cmd, capture_output=True, shell=True, text=True)
+    log.info(f"cmd({shlex.join(cmd)})")
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 
 def sysfs_write(path: Path, text):
@@ -110,9 +111,9 @@ def mount_hugetlbfs(args):
     if not mountpoint.exists():
         mountpoint.mkdir(parents=True)
 
-    cmd = f"mount -t hugetlbfs nodev {mountpoint}"
+    cmd = ["mount", "-t", "hugetlbfs", "nodev", str(mountpoint)]
     if args.pagesize:
-        cmd += f" -o pagesize={args.pagesize}k"
+        cmd += ["-o", f"pagesize={args.pagesize}k"]
     result = run(cmd)
     if result.returncode != 0:
         log.error(f"Failed to mount hugetlbfs: {result.stderr}")
