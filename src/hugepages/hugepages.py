@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) Simon Andreas Frimann Lund <os@safl.dk>
 #
-# Tool for inspecting and configuring hugepages on Linux
+# Tool for inspecting and configuring hugepages on Linux and FreeBSD
 #
 import argparse
 import errno
@@ -66,7 +66,12 @@ class LinuxBackend:
 
     A backend provides ``supported_sizes``/``info``/``setup``/``mount``;
     get_backend() picks one per platform and main() dispatches to it.
+    ``supported_sizes`` lists the --size choices; an empty list means
+    --size is free-form and ``setup`` validates it, with ``default_size``
+    as the fallback default.
     """
+
+    default_size = None  # --size defaults to the first supported size
 
     def supported_sizes(self):
         sizes = []
@@ -128,10 +133,179 @@ class LinuxBackend:
         print(f"Mounted hugetlbfs at {mountpoint}")
 
 
+class FreeBSDBackend:
+    """Contiguous-memory pool management on FreeBSD via DPDK's contigmem
+
+    FreeBSD has no hugetlbfs and no reservable hugepage pool. The DPDK
+    contigmem kernel module fills that role: at load time it reserves
+    physically contiguous buffers and exposes them at /dev/contigmem.
+    ``setup`` maps --size/--count onto the module tunables and (re)loads
+    it; ``info`` reads the pool back from the hw.contigmem sysctls.
+    """
+
+    # contigmem's own default buffer size: 512 MiB, expressed in kB.
+    default_size = "524288"
+
+    # Compile-time cap in the module (RTE_CONTIGMEM_MAX_NUM_BUFS).
+    MAX_BUFFERS = 64
+
+    DEVICE = Path("/dev/contigmem")
+
+    def supported_sizes(self):
+        # Any power-of-two size loads, so there are no fixed choices;
+        # setup() validates instead.
+        return []
+
+    def _sysctl(self, name):
+        result = run(["sysctl", "-n", name])
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    def _pool(self):
+        """Return (num_buffers, buffer_size) or None while not loaded"""
+
+        num = self._sysctl("hw.contigmem.num_buffers")
+        size = self._sysctl("hw.contigmem.buffer_size")
+        if num is None or size is None:
+            return None
+        return int(num), int(size)
+
+    @staticmethod
+    def loader_conf(count, size_bytes):
+        """The /boot/loader.conf lines that reserve the pool at boot"""
+
+        return [
+            f"hw.contigmem.num_buffers={count}",
+            f"hw.contigmem.buffer_size={size_bytes}",
+            'contigmem_load="YES"',
+        ]
+
+    def info(self, args):
+        pool = self._pool()
+        if pool is None:
+            print("Contigmem pool: not loaded")
+            print("Reserve one with: hugepages setup --size <kB> --count <buffers>")
+            return
+
+        num, size = pool
+        references = self._sysctl("hw.contigmem.num_references") or "0"
+        print("Contigmem pool:")
+        print(f"  Buffers: {num}  Size: {size // 1024} kB  Total: {num * size // 1024} kB")
+        print(f"  References: {references}")
+        for index in range(num):
+            physaddr = self._sysctl(f"hw.contigmem.physaddr.{index}")
+            if physaddr is not None:
+                print(f"  Buffer {index}: physical address {int(physaddr):#x}")
+
+    def setup(self, args):
+        """Reserve the pool by (re)loading contigmem with the requested tunables"""
+
+        if os.geteuid() != 0:
+            log.error("Configuring contigmem requires root. Re-run with sudo.")
+            sys.exit(errno.EPERM)
+
+        if not args.count:
+            self._release()
+            return
+
+        try:
+            size_kb = int(args.size)
+        except (TypeError, ValueError):
+            log.error(f"Invalid buffer size: {args.size!r}. Give the size in kB.")
+            sys.exit(1)
+
+        size_bytes = size_kb * 1024
+        pagesize = int(self._sysctl("hw.pagesize") or 4096)
+        # The module rejects sizes that are not powers of two above the page size.
+        if args.count < 0 or size_bytes <= pagesize or size_bytes & (size_bytes - 1):
+            log.error(
+                f"Invalid pool: count({args.count}) x size({size_kb}) kB. "
+                f"contigmem needs a power-of-two size larger than {pagesize // 1024} kB."
+            )
+            sys.exit(1)
+        if args.count > self.MAX_BUFFERS:
+            log.warning(
+                f"count({args.count}) exceeds the module's default cap of "
+                f"{self.MAX_BUFFERS} buffers; loading may fail."
+            )
+
+        pool = self._pool()
+        if pool == (args.count, size_bytes):
+            print(f"contigmem already provides {args.count} x {size_kb} kB buffer(s).")
+            return
+        if pool is not None:
+            # Tunables only apply at load time, so reconfiguring means a reload.
+            self._unload()
+
+        for name, value in (
+            ("hw.contigmem.num_buffers", args.count),
+            ("hw.contigmem.buffer_size", size_bytes),
+        ):
+            result = run(["kenv", f"{name}={value}"])
+            if result.returncode != 0:
+                log.error(f"Failed to set {name}: {result.stderr.strip()}")
+                sys.exit(1)
+
+        result = run(["kldload", "contigmem"])
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            log.error(f"Failed to load contigmem: {stderr}")
+            if "no such file" in stderr.lower():
+                log.error("contigmem.ko ships with DPDK. Install it with: pkg install dpdk")
+            else:
+                log.error("If memory is too fragmented, reserve at boot via /boot/loader.conf:")
+                for line in self.loader_conf(args.count, size_bytes):
+                    log.error(f"  {line}")
+            sys.exit(1)
+
+        actual = self._pool()
+        if actual != (args.count, size_bytes):
+            log.error(f"contigmem loaded, but the pool is {actual}, not the requested one.")
+            sys.exit(1)
+
+        total_kb = args.count * size_bytes // 1024
+        print(
+            f"Reserved {args.count} x {size_kb} kB buffer(s) ({total_kb} kB total) at {self.DEVICE}"
+        )
+        print("To reserve at every boot, add to /boot/loader.conf:")
+        for line in self.loader_conf(args.count, size_bytes):
+            print(f"  {line}")
+
+    def _release(self):
+        if self._pool() is None:
+            print("contigmem is not loaded; nothing to release.")
+            return
+        self._unload()
+        print("Unloaded contigmem and released its buffers.")
+
+    def _unload(self):
+        result = run(["kldunload", "contigmem"])
+        if result.returncode != 0:
+            references = self._sysctl("hw.contigmem.num_references")
+            log.error(f"Failed to unload contigmem: {result.stderr.strip()}")
+            if references and references != "0":
+                log.error(
+                    f"{references} mapping(s) still reference the pool. "
+                    "Stop the processes using it first."
+                )
+            sys.exit(1)
+
+    def mount(self, args):
+        print("FreeBSD has no hugetlbfs to mount.")
+        if self.DEVICE.exists():
+            print(f"The contigmem pool is available at {self.DEVICE}.")
+            print("Map buffer i with mmap on that device at offset i * PAGE_SIZE.")
+        else:
+            print(f"{self.DEVICE} does not exist. Reserve a pool first: hugepages setup")
+
+
 def get_backend(system=None):
     system = system or platform.system()
     if system == "Linux":
         return LinuxBackend()
+    if system == "FreeBSD":
+        return FreeBSDBackend()
     return None
 
 
@@ -142,7 +316,7 @@ def parse_args(backend):
         supported_sizes = []
         log.warning(f"Could not read supported hugepage sizes: {exc}")
 
-    parser = argparse.ArgumentParser(description="Inspect and manage Linux hugepages")
+    parser = argparse.ArgumentParser(description="Inspect and manage Linux/FreeBSD hugepages")
 
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
@@ -156,11 +330,15 @@ def parse_args(backend):
     setup.add_argument(
         "--size",
         choices=supported_sizes if supported_sizes else None,
-        default=supported_sizes[0] if supported_sizes else None,
-        help="Hugepage size in kB",
+        default=supported_sizes[0]
+        if supported_sizes
+        else (backend.default_size if backend else None),
+        help="Hugepage size in kB (FreeBSD: contigmem buffer size in kB)",
     )
 
-    setup.add_argument("--count", required=True, type=int, help="Number of pages to reserve")
+    setup.add_argument(
+        "--count", required=True, type=int, help="Number of pages (FreeBSD: buffers) to reserve"
+    )
 
     mount = subparsers.add_parser("mount", help="Mount hugetlbfs")
     mount.add_argument("--mountpoint", help="Mount location (default: /dev/hugepages)")
@@ -198,7 +376,7 @@ def main():
         sys.exit(1)
 
     if backend is None:
-        log.error(f"Unsupported platform: {platform.system()}. Supported: Linux.")
+        log.error(f"Unsupported platform: {platform.system()}. Supported: Linux, FreeBSD.")
         sys.exit(1)
 
     if args.command == "info":
