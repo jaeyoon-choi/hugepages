@@ -184,9 +184,13 @@ def main():
         sys.stdout.write(BASH_COMPLETION)
         return
 
+    # force=True: anything logged before this call (e.g. a parse_args()
+    # warning) implicitly configures the root logger. Without force this
+    # call is a no-op and --verbose silently does nothing.
     log.basicConfig(
         level=log.DEBUG if args.verbose else log.INFO,
         format="# %(levelname)s: %(message)s",
+        force=True,
     )
 
     if args.command is None:
