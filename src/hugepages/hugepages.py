@@ -4,18 +4,27 @@
 #
 # Tool for inspecting and configuring hugepages on Linux
 #
+# Platform-specific operations (reporting, reserving, and exposing large
+# pages) are handled by a Platform selected at runtime via get_platform():
+#
+# * Linux -- the hugepage pool in /sys/kernel/mm/hugepages + hugetlbfs
+#
+# Kept as a single, stdlib-only file so it can be installed by copying this
+# script.
+#
+import abc
 import argparse
 import errno
 import logging as log
 import os
+import platform
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 __version__ = "0.2.10"
-
-SYSFS_HUGEPAGES = Path("/sys/kernel/mm/hugepages")
 
 BASH_COMPLETION = r"""# bash completion for hugepages
 _hugepages() {
@@ -66,76 +75,113 @@ def sysfs_write(path: Path, text):
         return f.write(f"{text}\n")
 
 
-def list_supported_sizes():
-    sizes = []
-    for entry in SYSFS_HUGEPAGES.glob("hugepages-*kB"):
-        sizes.append(entry.name.split("-")[1].replace("kB", ""))
-    return sizes
+class Platform(abc.ABC):
+    """Platform-specific hugepage operations"""
+
+    @abc.abstractmethod
+    def info(self):
+        """Print the current hugepage state"""
+
+    @abc.abstractmethod
+    def setup(self, size: Optional[int], count: int):
+        """Reserve count pages of size kB
+
+        A size of None picks the platform default. A count of 0 releases
+        the pool.
+        """
+
+    @abc.abstractmethod
+    def mount(self, mountpoint: Optional[str] = None, pagesize: Optional[str] = None):
+        """Make the reserved pages reachable through the filesystem"""
 
 
-def show_info():
-    print("Hugepage Support:")
-    for entry in SYSFS_HUGEPAGES.glob("hugepages-*kB"):
-        size = entry.name.split("-")[1]
-        nr = int((entry / "nr_hugepages").read_text())
-        free = int((entry / "free_hugepages").read_text())
-        resv = int((entry / "resv_hugepages").read_text())
-        print(f"  Size: {size}  Total: {nr}  Free: {free}  Reserved: {resv}")
+# --- Linux platform -----------------------------------------------------------
 
 
-def setup_pages(size, count):
-    """Setup hugepages via sysfs
+class Linux(Platform):
+    """Hugepage management on Linux
 
-    A size of None picks the smallest supported one.
+    Reads the per-size pools under /sys/kernel/mm/hugepages, reserves pages
+    by writing nr_hugepages, and mounts hugetlbfs with mount(8).
     """
 
-    if size is None:
-        supported = list_supported_sizes()
-        if not supported:
-            log.error("No hugepage sizes are supported by this kernel.")
+    #: Per-size hugepage pools exported by the kernel
+    SYSFS = Path("/sys/kernel/mm/hugepages")
+
+    def supported_sizes(self) -> list:
+        sizes = []
+        for entry in self.SYSFS.glob("hugepages-*kB"):
+            sizes.append(int(entry.name.split("-")[1].replace("kB", "")))
+        return sizes
+
+    def info(self):
+        print("Hugepage Support:")
+        for entry in self.SYSFS.glob("hugepages-*kB"):
+            size = entry.name.split("-")[1]
+            nr = int((entry / "nr_hugepages").read_text())
+            free = int((entry / "free_hugepages").read_text())
+            resv = int((entry / "resv_hugepages").read_text())
+            print(f"  Size: {size}  Total: {nr}  Free: {free}  Reserved: {resv}")
+
+    def setup(self, size: Optional[int], count: int):
+        """Setup hugepages via sysfs"""
+
+        if size is None:
+            supported = self.supported_sizes()
+            if not supported:
+                log.error("No hugepage sizes are supported by this kernel.")
+                sys.exit(1)
+            size = min(supported)
+
+        target = self.SYSFS / f"hugepages-{size}kB" / "nr_hugepages"
+        if not target.exists():
+            log.error(f"Invalid hugepage size: {size}kB")
             sys.exit(1)
-        size = min(supported)
 
-    target = SYSFS_HUGEPAGES / f"hugepages-{size}kB" / "nr_hugepages"
-    if not target.exists():
-        log.error(f"Invalid hugepage size: {size}kB")
-        sys.exit(1)
+        try:
+            sysfs_write(target, str(count))
+        except PermissionError:
+            log.error("Reserving hugepages requires root. Re-run with sudo.")
+            sys.exit(errno.EPERM)
 
-    try:
-        sysfs_write(target, str(count))
-    except PermissionError:
-        log.error("Reserving hugepages requires root. Re-run with sudo.")
-        sys.exit(errno.EPERM)
+        try:
+            actual = int(target.read_text())
+            # count(0) is the documented way to release the pool, so reading
+            # back 0 is success there rather than a failed reservation.
+            if count and not actual:
+                log.error(f"No hugepages were reserved out of count({count}) for size({size}) kB")
+            elif actual < count:
+                log.warning(
+                    f"Only {actual} hugepage(s) were reserved out of count({count}) "
+                    f"for size({size}) kB"
+                )
+        except Exception as exc:
+            log.error(f"Failed to verify hugepage allocation: {exc}")
+            sys.exit(1)
 
-    try:
-        actual = int(target.read_text())
-        # count(0) is the documented way to release the pool, so reading
-        # back 0 is success there rather than a failed reservation.
-        if count and not actual:
-            log.error(f"No hugepages were reserved out of count({count}) for size({size}) kB")
-        elif actual < count:
-            log.warning(
-                f"Only {actual} hugepage(s) were reserved out of count({count}) "
-                f"for size({size}) kB"
-            )
-    except Exception as exc:
-        log.error(f"Failed to verify hugepage allocation: {exc}")
-        sys.exit(1)
+    def mount(self, mountpoint: Optional[str] = None, pagesize: Optional[str] = None):
+        target = Path(mountpoint or "/dev/hugepages")
+        if not target.exists():
+            target.mkdir(parents=True)
+
+        cmd = ["mount", "-t", "hugetlbfs", "nodev", str(target)]
+        if pagesize:
+            cmd += ["-o", f"pagesize={pagesize}k"]
+        result = run(cmd)
+        if result.returncode != 0:
+            log.error(f"Failed to mount hugetlbfs: {result.stderr}")
+            sys.exit(1)
+        print(f"Mounted hugetlbfs at {target}")
 
 
-def mount_hugetlbfs(mountpoint=None, pagesize=None):
-    mountpoint = Path(mountpoint or "/dev/hugepages")
-    if not mountpoint.exists():
-        mountpoint.mkdir(parents=True)
+def get_platform() -> Platform:
+    """Return the Platform implementation for the running system"""
 
-    cmd = ["mount", "-t", "hugetlbfs", "nodev", str(mountpoint)]
-    if pagesize:
-        cmd += ["-o", f"pagesize={pagesize}k"]
-    result = run(cmd)
-    if result.returncode != 0:
-        log.error(f"Failed to mount hugetlbfs: {result.stderr}")
-        sys.exit(1)
-    print(f"Mounted hugetlbfs at {mountpoint}")
+    system = platform.system()
+    if system == "Linux":
+        return Linux()
+
+    raise NotImplementedError(f"hugepages does not support platform '{system}'; supported: Linux")
 
 
 def parse_args():
@@ -151,7 +197,7 @@ def parse_args():
     setup = subparsers.add_parser("setup", help="Configure hugepage pool")
 
     # The supported sizes are read from the running kernel, so they are
-    # resolved and validated by setup_pages() rather than by the parser.
+    # resolved and validated by the platform rather than by the parser.
     setup.add_argument("--size", type=int, help="Hugepage size in kB")
 
     setup.add_argument("--count", required=True, type=int, help="Number of pages to reserve")
@@ -182,15 +228,22 @@ def main():
     # that logged earlier would keep its level. Set it here instead.
     log.getLogger().setLevel(log.DEBUG if args.verbose else log.INFO)
 
-    if args.command == "info":
-        show_info()
-    elif args.command == "setup":
-        setup_pages(args.size, args.count)
-    elif args.command == "mount":
-        mount_hugetlbfs(args.mountpoint, args.pagesize)
-    else:
+    if args.command is None:
         log.error("No command specified. Use --help.")
         sys.exit(1)
+
+    try:
+        plat = get_platform()
+    except NotImplementedError as exc:
+        log.error(str(exc))
+        sys.exit(errno.ENOSYS)
+
+    if args.command == "info":
+        plat.info()
+    elif args.command == "setup":
+        plat.setup(args.size, args.count)
+    elif args.command == "mount":
+        plat.mount(args.mountpoint, args.pagesize)
 
 
 if __name__ == "__main__":

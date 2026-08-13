@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) Simon Andreas Frimann Lund <os@safl.dk>
 
+import errno
 import logging as log
 import subprocess
 import sys
@@ -71,3 +72,21 @@ def test_parser_leaves_the_size_to_the_platform(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", ["hugepages", "setup", "--count", "1", "--size", "8192"])
     assert hugepages.parse_args().size == 8192
+
+
+def _fake_system(monkeypatch, name):
+    monkeypatch.setattr(hugepages.platform, "system", lambda: name)
+
+
+def test_get_platform_dispatch(monkeypatch):
+    _fake_system(monkeypatch, "Linux")
+    assert isinstance(hugepages.get_platform(), hugepages.Linux)
+
+
+def test_main_exits_enosys_on_an_unsupported_system(monkeypatch, caplog):
+    _fake_system(monkeypatch, "Darwin")
+    monkeypatch.setattr(sys, "argv", ["hugepages", "info"])
+    with pytest.raises(SystemExit) as excinfo:
+        hugepages.main()
+    assert excinfo.value.code == errno.ENOSYS
+    assert "Darwin" in caplog.text
