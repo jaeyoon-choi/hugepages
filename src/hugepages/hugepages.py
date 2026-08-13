@@ -73,7 +73,7 @@ def list_supported_sizes():
     return sizes
 
 
-def show_info(args):
+def show_info():
     print("Hugepage Support:")
     for entry in SYSFS_HUGEPAGES.glob("hugepages-*kB"):
         size = entry.name.split("-")[1]
@@ -83,16 +83,26 @@ def show_info(args):
         print(f"  Size: {size}  Total: {nr}  Free: {free}  Reserved: {resv}")
 
 
-def setup_pages(args):
-    """Setup hugepages via sysfs"""
+def setup_pages(size, count):
+    """Setup hugepages via sysfs
 
-    target = SYSFS_HUGEPAGES / f"hugepages-{args.size}kB" / "nr_hugepages"
+    A size of None picks the smallest supported one.
+    """
+
+    if size is None:
+        supported = list_supported_sizes()
+        if not supported:
+            log.error("No hugepage sizes are supported by this kernel.")
+            sys.exit(1)
+        size = min(supported)
+
+    target = SYSFS_HUGEPAGES / f"hugepages-{size}kB" / "nr_hugepages"
     if not target.exists():
-        log.error(f"Invalid hugepage size: {args.size}kB")
+        log.error(f"Invalid hugepage size: {size}kB")
         sys.exit(1)
 
     try:
-        sysfs_write(target, str(args.count))
+        sysfs_write(target, str(count))
     except PermissionError:
         log.error("Reserving hugepages requires root. Re-run with sudo.")
         sys.exit(errno.EPERM)
@@ -101,27 +111,26 @@ def setup_pages(args):
         actual = int(target.read_text())
         # count(0) is the documented way to release the pool, so reading
         # back 0 is success there rather than a failed reservation.
-        if args.count and not actual:
-            log.error(
-                f"No hugepages were reserved out of count({args.count}) for size({args.size}) kB"
-            )
-        elif actual < args.count:
+        if count and not actual:
+            log.error(f"No hugepages were reserved out of count({count}) for size({size}) kB")
+        elif actual < count:
             log.warning(
-                f"Only {actual} hugepage(s) were reserved out of count({args.count}) for size({args.size}) kB"
+                f"Only {actual} hugepage(s) were reserved out of count({count}) "
+                f"for size({size}) kB"
             )
     except Exception as exc:
         log.error(f"Failed to verify hugepage allocation: {exc}")
         sys.exit(1)
 
 
-def mount_hugetlbfs(args):
-    mountpoint = Path(args.mountpoint or "/dev/hugepages")
+def mount_hugetlbfs(mountpoint=None, pagesize=None):
+    mountpoint = Path(mountpoint or "/dev/hugepages")
     if not mountpoint.exists():
         mountpoint.mkdir(parents=True)
 
     cmd = ["mount", "-t", "hugetlbfs", "nodev", str(mountpoint)]
-    if args.pagesize:
-        cmd += ["-o", f"pagesize={args.pagesize}k"]
+    if pagesize:
+        cmd += ["-o", f"pagesize={pagesize}k"]
     result = run(cmd)
     if result.returncode != 0:
         log.error(f"Failed to mount hugetlbfs: {result.stderr}")
@@ -130,12 +139,6 @@ def mount_hugetlbfs(args):
 
 
 def parse_args():
-    try:
-        supported_sizes = list_supported_sizes()
-    except Exception as exc:
-        supported_sizes = []
-        log.warning(f"Could not read supported hugepage sizes: {exc}")
-
     parser = argparse.ArgumentParser(description="Inspect and manage Linux hugepages")
 
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -147,12 +150,9 @@ def parse_args():
 
     setup = subparsers.add_parser("setup", help="Configure hugepage pool")
 
-    setup.add_argument(
-        "--size",
-        choices=supported_sizes if supported_sizes else None,
-        default=supported_sizes[0] if supported_sizes else None,
-        help="Hugepage size in kB",
-    )
+    # The supported sizes are read from the running kernel, so they are
+    # resolved and validated by setup_pages() rather than by the parser.
+    setup.add_argument("--size", type=int, help="Hugepage size in kB")
 
     setup.add_argument("--count", required=True, type=int, help="Number of pages to reserve")
 
@@ -183,11 +183,11 @@ def main():
     log.getLogger().setLevel(log.DEBUG if args.verbose else log.INFO)
 
     if args.command == "info":
-        show_info(args)
+        show_info()
     elif args.command == "setup":
-        setup_pages(args)
+        setup_pages(args.size, args.count)
     elif args.command == "mount":
-        mount_hugetlbfs(args)
+        mount_hugetlbfs(args.mountpoint, args.pagesize)
     else:
         log.error("No command specified. Use --help.")
         sys.exit(1)

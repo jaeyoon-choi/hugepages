@@ -54,14 +54,20 @@ def test_run_traces_commands_at_debug(caplog):
 
 
 def test_verbose_survives_logging_before_main_configures_it(monkeypatch):
-    # parse_args() warns when the sizes cannot be read. That first log call
-    # implicitly configures the root logger, which used to leave
-    # basicConfig() a no-op and --verbose without effect.
-    def _unreadable():
-        raise OSError("sysfs unreadable")
+    # Anything logged before main() configures logging implicitly sets the
+    # root logger up, which used to leave --verbose without effect.
+    log.info("a stray log line before main() configures logging")
 
-    monkeypatch.setattr(hugepages, "list_supported_sizes", _unreadable)
     monkeypatch.setattr(sys, "argv", ["hugepages", "--verbose"])
     with pytest.raises(SystemExit):
         hugepages.main()
     assert log.getLogger().level == log.DEBUG
+
+
+def test_parser_leaves_the_size_to_the_platform(monkeypatch):
+    # No fixed choices and no default: setup_pages() resolves and validates.
+    monkeypatch.setattr(sys, "argv", ["hugepages", "setup", "--count", "1"])
+    assert hugepages.parse_args().size is None
+
+    monkeypatch.setattr(sys, "argv", ["hugepages", "setup", "--count", "1", "--size", "8192"])
+    assert hugepages.parse_args().size == 8192
