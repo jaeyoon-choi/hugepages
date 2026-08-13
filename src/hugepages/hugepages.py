@@ -51,7 +51,13 @@ def run(cmd: list):
     """Run a command, without a shell, and capture the output"""
 
     log.info(f"cmd({shlex.join(cmd)})")
-    return subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        # Shell convention: 127 for a missing binary, 126 for any other
+        # exec failure.
+        code = 127 if isinstance(exc, FileNotFoundError) else 126
+        return subprocess.CompletedProcess(cmd, code, stdout="", stderr=str(exc))
 
 
 def sysfs_write(path: Path, text):

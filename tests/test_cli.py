@@ -26,6 +26,22 @@ def test_import():
     assert callable(main)
 
 
+def test_run_reports_a_missing_binary_as_a_failed_command():
+    # Callers branch on a returncode, never on an exception.
+    result = hugepages.run(["hugepages-no-such-binary"])
+    assert result.returncode == 127
+    assert result.stderr
+
+
+def test_run_reports_a_non_executable_file_as_a_failed_command(tmp_path):
+    tool = tmp_path / "tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o644)
+    result = hugepages.run([str(tool)])
+    assert result.returncode == 126
+    assert result.stderr
+
+
 def test_verbose_survives_logging_before_main_configures_it(monkeypatch):
     # parse_args() warns when the sizes cannot be read. That first log call
     # implicitly configures the root logger, which used to leave
