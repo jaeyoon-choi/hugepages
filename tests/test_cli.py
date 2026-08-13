@@ -42,6 +42,17 @@ def test_run_reports_a_non_executable_file_as_a_failed_command(tmp_path):
     assert result.stderr
 
 
+def test_run_traces_commands_at_debug(caplog):
+    # INFO is the default level, so traces must stay hidden without --verbose.
+    caplog.set_level(log.INFO)
+    hugepages.run(["hugepages-no-such-binary"])
+    assert not caplog.records
+
+    caplog.set_level(log.DEBUG)
+    hugepages.run(["hugepages-no-such-binary"])
+    assert any("cmd(" in record.message for record in caplog.records)
+
+
 def test_verbose_survives_logging_before_main_configures_it(monkeypatch):
     # parse_args() warns when the sizes cannot be read. That first log call
     # implicitly configures the root logger, which used to leave

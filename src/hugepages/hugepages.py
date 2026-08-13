@@ -50,7 +50,7 @@ complete -F _hugepages hugepages
 def run(cmd: list):
     """Run a command, without a shell, and capture the output"""
 
-    log.info(f"cmd({shlex.join(cmd)})")
+    log.debug(f"cmd({shlex.join(cmd)})")
     try:
         return subprocess.run(cmd, capture_output=True, text=True)
     except OSError as exc:
@@ -61,7 +61,7 @@ def run(cmd: list):
 
 
 def sysfs_write(path: Path, text):
-    log.info(f'{path} "{text}"')
+    log.debug(f'{path} "{text}"')
     with os.fdopen(os.open(path, os.O_WRONLY), "w") as f:
         return f.write(f"{text}\n")
 
