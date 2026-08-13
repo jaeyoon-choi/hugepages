@@ -171,10 +171,10 @@ def main():
         sys.stdout.write(BASH_COMPLETION)
         return
 
-    log.basicConfig(
-        level=log.DEBUG if args.verbose else log.INFO,
-        format="# %(levelname)s: %(message)s",
-    )
+    log.basicConfig(format="# %(levelname)s: %(message)s")
+    # basicConfig() only installs a handler when there is none, so anything
+    # that logged earlier would keep its level. Set it here instead.
+    log.getLogger().setLevel(log.DEBUG if args.verbose else log.INFO)
 
     if args.command == "info":
         show_info(args)
