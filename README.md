@@ -6,11 +6,13 @@
 [![Python](https://img.shields.io/pypi/pyversions/hugepages.svg)](https://pypi.org/project/hugepages/)
 [![Test](https://github.com/xnvme/hugepages/actions/workflows/test.yml/badge.svg)](https://github.com/xnvme/hugepages/actions/workflows/test.yml)
 
-`hugepages` is a small CLI for inspecting and configuring the Linux
-hugepage pool. It reports current totals, free, and reserved counts per
-supported page size, reserves pages via the sysfs interface at
+`hugepages` is a small CLI for inspecting and configuring hugepages on
+Linux and FreeBSD. On Linux it reports current totals, free, and reserved
+counts per supported page size, reserves pages via the sysfs interface at
 `/sys/kernel/mm/hugepages/`, and mounts the hugetlbfs filesystem
-(default `/dev/hugepages`).
+(default `/dev/hugepages`). On FreeBSD it manages the pool of physically
+contiguous buffers provided by the DPDK `contigmem` kernel module; see
+[Platform differences](#platform-differences).
 
 ## Install
 
@@ -40,13 +42,13 @@ $ hugepages --help
 usage: hugepages [-h] [--version] [--verbose] [--print-completion SHELL]
                  {info,setup,mount} ...
 
-Inspect and manage Linux hugepages
+Inspect and manage hugepages on Linux and FreeBSD
 
 positional arguments:
   {info,setup,mount}
     info                Show hugepage status and capabilities
     setup               Configure hugepage pool
-    mount               Mount hugetlbfs
+    mount               Mount hugetlbfs (FreeBSD: report the pool device)
 
 options:
   -h, --help            show this help message and exit
@@ -90,6 +92,34 @@ needed. Modern DPDK and custom xNVMe/uPCIe code take this path.
 (default `/dev/hugepages`). Programs that want file-backed hugepages
 with named-page semantics open and mmap files under the mountpoint.
 SPDK and classic DPDK with `--huge-dir` use this path.
+
+## Platform differences
+
+Linux and FreeBSD expose large pages through different models, so the
+same subcommands map to different mechanisms per platform:
+
+| Command | Linux | FreeBSD |
+| ------- | ----- | ------- |
+| `info`  | totals/free/reserved per size from `/sys/kernel/mm/hugepages/` | contigmem pool state from the `hw.contigmem` sysctls |
+| `setup` | reserves pages in the kernel pool via sysfs | sets the module tunables and (re)loads `contigmem.ko` |
+| `mount` | mounts `hugetlbfs` (default `/dev/hugepages`) | informational — the pool is a device node, `/dev/contigmem` |
+
+FreeBSD has no hugetlbfs and no reservable hugepage pool. The DPDK
+`contigmem` kernel module fills that role: at load time it reserves
+`hw.contigmem.num_buffers` physically contiguous buffers of
+`hw.contigmem.buffer_size` bytes each and exposes them at
+`/dev/contigmem`. `hugepages setup --size <kB> --count <n>` maps `--size`
+onto the buffer size and `--count` onto the number of buffers, then
+(re)loads the module. Sizes must be powers of two and at most 64 buffers
+can be reserved. The default size is contigmem's own 512 MiB. `--count 0`
+unloads the module and releases the memory. Applications map buffer `i`
+by calling `mmap` on `/dev/contigmem` with offset `i * PAGE_SIZE`.
+
+The module ships with DPDK (`pkg install dpdk`). Its tunables only apply
+at load time, so reconfiguring reloads the module — that fails while a
+process still maps the pool. Physically contiguous memory fragments as
+the system runs, so large pools are best reserved at boot; `setup`
+prints the `/boot/loader.conf` lines that do so.
 
 ## Related
 
