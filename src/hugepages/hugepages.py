@@ -69,6 +69,15 @@ def run(cmd: list):
         return subprocess.CompletedProcess(cmd, code, stdout="", stderr=str(exc))
 
 
+def read_int(path: Path) -> int:
+    """Read a single integer out of a sysfs file"""
+
+    try:
+        return int(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise OSError(errno.EIO, f"Failed to read {path}: {exc}") from exc
+
+
 def sysfs_write(path: Path, text):
     log.debug(f'{path} "{text}"')
     with os.fdopen(os.open(path, os.O_WRONLY), "w") as f:
@@ -111,66 +120,94 @@ class Linux(Platform):
     def supported_sizes(self) -> list:
         sizes = []
         for entry in self.SYSFS.glob("hugepages-*kB"):
-            sizes.append(int(entry.name.split("-")[1].replace("kB", "")))
+            token = entry.name.split("-")[1].replace("kB", "")
+            if token.isdigit():
+                sizes.append(int(token))
         return sizes
 
     def info(self):
         print("Hugepage Support:")
         for entry in self.SYSFS.glob("hugepages-*kB"):
             size = entry.name.split("-")[1]
-            nr = int((entry / "nr_hugepages").read_text())
-            free = int((entry / "free_hugepages").read_text())
-            resv = int((entry / "resv_hugepages").read_text())
+            nr = read_int(entry / "nr_hugepages")
+            free = read_int(entry / "free_hugepages")
+            resv = read_int(entry / "resv_hugepages")
             print(f"  Size: {size}  Total: {nr}  Free: {free}  Reserved: {resv}")
 
     def setup(self, size: Optional[int], count: int):
         """Setup hugepages via sysfs"""
 
+        if count < 0:
+            raise OSError(
+                errno.EINVAL, f"Invalid count: {count}. Give a page count, or 0 to release."
+            )
+
         if size is None:
             supported = self.supported_sizes()
             if not supported:
-                log.error("No hugepage sizes are supported by this kernel.")
-                sys.exit(1)
+                raise OSError(errno.ENOTSUP, "No hugepage sizes are supported by this kernel.")
             size = min(supported)
 
         target = self.SYSFS / f"hugepages-{size}kB" / "nr_hugepages"
         if not target.exists():
-            log.error(f"Invalid hugepage size: {size}kB")
-            sys.exit(1)
+            supported = ", ".join(f"{each}" for each in self.supported_sizes())
+            raise OSError(
+                errno.EINVAL,
+                f"Invalid hugepage size: {size} kB. This kernel supports: {supported or 'none'}.",
+            )
 
         try:
             sysfs_write(target, str(count))
-        except PermissionError:
-            log.error("Reserving hugepages requires root. Re-run with sudo.")
-            sys.exit(errno.EPERM)
+        except PermissionError as exc:
+            raise PermissionError(
+                errno.EPERM, "Reserving hugepages requires root. Re-run with sudo."
+            ) from exc
 
-        try:
-            actual = int(target.read_text())
-            # count(0) is the documented way to release the pool, so reading
-            # back 0 is success there rather than a failed reservation.
-            if count and not actual:
-                log.error(f"No hugepages were reserved out of count({count}) for size({size}) kB")
-            elif actual < count:
-                log.warning(
-                    f"Only {actual} hugepage(s) were reserved out of count({count}) "
-                    f"for size({size}) kB"
+        actual = read_int(target)
+
+        # Writing 0 releases the pool, so a zero readback is success there.
+        if not count:
+            if actual:
+                raise OSError(
+                    errno.EBUSY,
+                    f"{actual} hugepage(s) of size({size}) kB are still reserved; "
+                    "pages in use cannot be released.",
                 )
-        except Exception as exc:
-            log.error(f"Failed to verify hugepage allocation: {exc}")
-            sys.exit(1)
+            return
+        if not actual:
+            raise OSError(
+                errno.ENOMEM,
+                f"No hugepages were reserved out of count({count}) for size({size}) kB",
+            )
+        if actual < count:
+            log.warning(
+                f"Only {actual} hugepage(s) were reserved out of count({count}) "
+                f"for size({size}) kB"
+            )
 
     def mount(self, mountpoint: Optional[str] = None, pagesize: Optional[str] = None):
         target = Path(mountpoint or "/dev/hugepages")
-        if not target.exists():
-            target.mkdir(parents=True)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except PermissionError as exc:
+            raise PermissionError(
+                errno.EPERM, f"Creating {target} requires root. Re-run with sudo."
+            ) from exc
+        except OSError as exc:
+            raise OSError(
+                exc.errno or errno.EIO, f"Failed to create {target}: {exc.strerror}"
+            ) from exc
 
         cmd = ["mount", "-t", "hugetlbfs", "nodev", str(target)]
         if pagesize:
             cmd += ["-o", f"pagesize={pagesize}k"]
         result = run(cmd)
         if result.returncode != 0:
-            log.error(f"Failed to mount hugetlbfs: {result.stderr}")
-            sys.exit(1)
+            raise OSError(
+                errno.EIO,
+                f"Failed to mount hugetlbfs (mount exited {result.returncode}): "
+                f"{result.stderr.strip()}",
+            )
         print(f"Mounted hugetlbfs at {target}")
 
 
@@ -238,12 +275,20 @@ def main():
         log.error(str(exc))
         sys.exit(errno.ENOSYS)
 
-    if args.command == "info":
-        plat.info()
-    elif args.command == "setup":
-        plat.setup(args.size, args.count)
-    elif args.command == "mount":
-        plat.mount(args.mountpoint, args.pagesize)
+    try:
+        if args.command == "info":
+            plat.info()
+        elif args.command == "setup":
+            plat.setup(args.size, args.count)
+        elif args.command == "mount":
+            plat.mount(args.mountpoint, args.pagesize)
+    except OSError as exc:
+        message = exc.strerror or str(exc)
+        if exc.filename:
+            message = f"{message}: {exc.filename}"
+        for line in message.splitlines():
+            log.error(line)
+        sys.exit(exc.errno or 1)
 
 
 if __name__ == "__main__":

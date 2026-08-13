@@ -6,6 +6,18 @@ import logging as log
 
 import pytest
 
+from hugepages import hugepages
+
+
+@pytest.fixture
+def fake_system(monkeypatch):
+    """Make get_platform() believe it runs on a given system"""
+
+    def _fake(name):
+        monkeypatch.setattr(hugepages.platform, "system", lambda: name)
+
+    return _fake
+
 
 @pytest.fixture(autouse=True)
 def restore_log_level():
